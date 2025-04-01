@@ -57,8 +57,12 @@ func main() {
 		fmt.Printf("Error writing summary CSV: %v\n", err)
 		os.Exit(1)
 	}
+	if err := writeYearlySummaryCSV(results); err != nil {
+		fmt.Printf("Error writing yearly summary CSV: %v\n", err)
+		os.Exit(1)
+	}
 
-	fmt.Println("Scan completed successfully. CSV files generated.")
+	fmt.Println("Scan completed successfully. CSV files generated: commit_info.csv, commit_summary.csv, yearly_summary.csv")
 }
 
 // findGitRepos finds all bare git repositories in the given directory
@@ -158,7 +162,8 @@ func processRepo(repoPath string) ([]CommitInfo, error) {
 		// Get commit history for this branch
 		commitIter, err := repo.Log(&git.LogOptions{From: ref.Hash()})
 		if err != nil {
-			return fmt.Errorf("failed to get commit history for branch %s: %w", branchName, err)
+			return fmt.Errorf("failed to get commit history for branch %s: %w",
+				branchName, err)
 		}
 
 		err = commitIter.ForEach(func(c *object.Commit) error {
@@ -218,6 +223,61 @@ func writeCommitInfoCSV(results []CommitInfo) error {
 			info.RepoName,
 			info.BranchName,
 			strconv.Itoa(info.CommitCount),
+		}
+		if err := writer.Write(row); err != nil {
+			return fmt.Errorf("failed to write row: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// writeYearlySummaryCSV writes the yearly commit summary to a CSV file
+func writeYearlySummaryCSV(results []CommitInfo) error {
+	file, err := os.Create("yearly_summary.csv")
+	if err != nil {
+		return fmt.Errorf("failed to create yearly_summary.csv: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Write header
+	header := []string{"Year", "CommitCount"}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Combine all commits by year
+	commitsByYear := make(map[int]int)
+	for _, info := range results {
+		commitsByYear[info.Year] += info.CommitCount
+	}
+
+	// Convert to slice for sorting
+	type YearlySummary struct {
+		Year  int
+		Count int
+	}
+	var summaries []YearlySummary
+	for year, count := range commitsByYear {
+		summaries = append(summaries, YearlySummary{
+			Year:  year,
+			Count: count,
+		})
+	}
+
+	// Sort by year
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].Year < summaries[j].Year
+	})
+
+	// Write data
+	for _, summary := range summaries {
+		row := []string{
+			strconv.Itoa(summary.Year),
+			strconv.Itoa(summary.Count),
 		}
 		if err := writer.Write(row); err != nil {
 			return fmt.Errorf("failed to write row: %w", err)
