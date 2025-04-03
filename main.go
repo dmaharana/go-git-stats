@@ -15,14 +15,14 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"time"
 )
 
-type CommitInfo struct {
-	Year          int
+// RepoBranchCommits holds commit data aggregated by date for a specific repo and branch.
+type RepoBranchCommits struct {
 	RepoName      string
 	BranchName    string
-	CommitCount   int
-	CommitsByDate map[string]int
+	CommitsByDate map[string]int // map[DateString]CommitCount
 }
 
 type SummaryEntry struct {
@@ -47,22 +47,29 @@ func main() {
 	// Process repositories in batches
 	results := processReposBatch(repos, *batchSize)
 
-	// Write results to CSV files
-	if err := writeCommitInfoCSV(results); err != nil {
+	// Ensure baseDir is absolute for reliable output path generation
+	outputDir, err := filepath.Abs(*baseDir)
+	if err != nil {
+		fmt.Printf("Error resolving absolute path for base directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Write results to CSV files in the specified base directory
+	if err := writeCommitInfoCSV(results, outputDir); err != nil {
 		fmt.Printf("Error writing commit info CSV: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := writeSummaryCSV(results); err != nil {
+	if err := writeSummaryCSV(results, outputDir); err != nil {
 		fmt.Printf("Error writing summary CSV: %v\n", err)
 		os.Exit(1)
 	}
-	if err := writeYearlySummaryCSV(results); err != nil {
+	if err := writeYearlySummaryCSV(results, outputDir); err != nil {
 		fmt.Printf("Error writing yearly summary CSV: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Scan completed successfully. CSV files generated: commit_info.csv, commit_summary.csv, yearly_summary.csv")
+	fmt.Printf("Scan completed successfully. CSV files generated in %s\n", outputDir)
 }
 
 // findGitRepos finds all bare git repositories in the given directory
@@ -91,8 +98,8 @@ func findGitRepos(baseDir string) ([]string, error) {
 }
 
 // processReposBatch processes repositories in concurrent batches
-func processReposBatch(repoPaths []string, batchSize int) []CommitInfo {
-	var results []CommitInfo
+func processReposBatch(repoPaths []string, batchSize int) []RepoBranchCommits {
+	var results []RepoBranchCommits
 	var mutex sync.Mutex
 	var wg sync.WaitGroup
 
@@ -128,7 +135,7 @@ func processReposBatch(repoPaths []string, batchSize int) []CommitInfo {
 }
 
 // processRepo processes a single git repository
-func processRepo(repoPath string) ([]CommitInfo, error) {
+func processRepo(repoPath string) ([]RepoBranchCommits, error) {
 	repo, err := git.PlainOpen(repoPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open repository: %w", err)
@@ -148,43 +155,42 @@ func processRepo(repoPath string) ([]CommitInfo, error) {
 		return nil, fmt.Errorf("failed to get references: %w", err)
 	}
 
-	var results []CommitInfo
+	var results []RepoBranchCommits
 
 	err = branches.ForEach(func(ref *plumbing.Reference) error {
-		if ref.Type() != plumbing.HashReference || ref.Name().IsBranch() == false {
+		// Only process local branches (refs/heads/)
+		if !ref.Name().IsBranch() {
 			return nil
-		}
+		} // <-- Added closing brace
 
 		branchName := ref.Name().Short()
-		commitsByYear := make(map[int]int)
-		commitsByDate := make(map[string]int)
+		commitsByDate := make(map[string]int) // map[DateString]CommitCount
 
 		// Get commit history for this branch
 		commitIter, err := repo.Log(&git.LogOptions{From: ref.Hash()})
 		if err != nil {
-			return fmt.Errorf("failed to get commit history for branch %s: %w",
-				branchName, err)
+			// Handle case where a branch might not have a resolvable commit (e.g., empty branch)
+			// Or other errors during Log retrieval
+			fmt.Printf("Warning: Could not get commit history for branch %s in repo %s: %v\n", branchName, repoName, err)
+			return nil // Skip this branch
 		}
 
 		err = commitIter.ForEach(func(c *object.Commit) error {
-			year := c.Author.When.Year()
 			dateStr := c.Author.When.Format("2006-01-02")
-			commitsByYear[year]++
 			commitsByDate[dateStr]++
 			return nil
-		})
+		}) // <-- Added closing parenthesis
 
 		if err != nil {
-			return fmt.Errorf("failed to iterate commits: %w", err)
+			// This error comes from the ForEach function itself
+			return fmt.Errorf("failed during commit iteration for branch %s: %w", branchName, err)
 		}
 
-		// Create CommitInfo entries for each year
-		for year, count := range commitsByYear {
-			results = append(results, CommitInfo{
-				Year:          year,
+		// Only add if there were commits on this branch
+		if len(commitsByDate) > 0 {
+			results = append(results, RepoBranchCommits{
 				RepoName:      repoName,
 				BranchName:    branchName,
-				CommitCount:   count,
 				CommitsByDate: commitsByDate,
 			})
 		}
@@ -199,33 +205,47 @@ func processRepo(repoPath string) ([]CommitInfo, error) {
 	return results, nil
 }
 
-// writeCommitInfoCSV writes the commit info to a CSV file
-func writeCommitInfoCSV(results []CommitInfo) error {
-	file, err := os.Create("commit_info.csv")
+// writeCommitInfoCSV writes the detailed commit info per date/repo/branch to a CSV file
+func writeCommitInfoCSV(results []RepoBranchCommits, outputDir string) error {
+	timestamp := time.Now().Format("20060102150405")
+	filename := fmt.Sprintf("commit_info_%s.csv", timestamp)
+	filepath := filepath.Join(outputDir, filename)
+
+	file, err := os.Create(filepath)
 	if err != nil {
-		return fmt.Errorf("failed to create commit_info.csv: %w", err)
+		return fmt.Errorf("failed to create %s: %w", filename, err)
 	}
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Write header
-	header := []string{"Year", "Repository", "Branch", "CommitCount"}
+	// Write header - TASK.md: date,repo,branch,commit_count
+	header := []string{"Date", "Repository", "Branch", "CommitCount"}
 	if err := writer.Write(header); err != nil {
-		return fmt.Errorf("failed to write header: %w", err)
+		return fmt.Errorf("failed to write header to %s: %w", filename, err)
 	}
 
 	// Write data
-	for _, info := range results {
-		row := []string{
-			strconv.Itoa(info.Year),
-			info.RepoName,
-			info.BranchName,
-			strconv.Itoa(info.CommitCount),
+	for _, result := range results {
+		// Sort dates for consistent output order
+		var dates []string
+		for date := range result.CommitsByDate {
+			dates = append(dates, date)
 		}
-		if err := writer.Write(row); err != nil {
-			return fmt.Errorf("failed to write row: %w", err)
+		sort.Strings(dates)
+
+		for _, date := range dates {
+			count := result.CommitsByDate[date]
+			row := []string{
+				date,
+				result.RepoName,
+				result.BranchName,
+				strconv.Itoa(count),
+			}
+			if err := writer.Write(row); err != nil {
+				return fmt.Errorf("failed to write row to %s: %w", filename, err)
+			}
 		}
 	}
 
@@ -233,26 +253,40 @@ func writeCommitInfoCSV(results []CommitInfo) error {
 }
 
 // writeYearlySummaryCSV writes the yearly commit summary to a CSV file
-func writeYearlySummaryCSV(results []CommitInfo) error {
-	file, err := os.Create("yearly_summary.csv")
+func writeYearlySummaryCSV(results []RepoBranchCommits, outputDir string) error {
+	timestamp := time.Now().Format("20060102150405")
+	filename := fmt.Sprintf("yearly_summary_%s.csv", timestamp)
+	filepath := filepath.Join(outputDir, filename)
+
+	file, err := os.Create(filepath)
 	if err != nil {
-		return fmt.Errorf("failed to create yearly_summary.csv: %w", err)
+		return fmt.Errorf("failed to create %s: %w", filename, err)
 	}
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Write header
+	// Write header - TASK.md: year,commit_count
 	header := []string{"Year", "CommitCount"}
 	if err := writer.Write(header); err != nil {
-		return fmt.Errorf("failed to write header: %w", err)
+		return fmt.Errorf("failed to write header to %s: %w", filename, err)
 	}
 
-	// Combine all commits by year
-	commitsByYear := make(map[int]int)
-	for _, info := range results {
-		commitsByYear[info.Year] += info.CommitCount
+	// Aggregate commits by year from all repos/branches
+	commitsByYear := make(map[int]int) // map[Year]TotalCommitCount
+	for _, result := range results {
+		for dateStr, count := range result.CommitsByDate {
+			// Parse date string to get the year
+			commitDate, err := time.Parse("2006-01-02", dateStr)
+			if err != nil {
+				// Should not happen if date format is correct
+				fmt.Printf("Warning: Could not parse date %s for repo %s, branch %s: %v\n",
+					dateStr, result.RepoName, result.BranchName, err)
+				continue
+			}
+			commitsByYear[commitDate.Year()] += count
+		}
 	}
 
 	// Convert to slice for sorting
@@ -280,34 +314,38 @@ func writeYearlySummaryCSV(results []CommitInfo) error {
 			strconv.Itoa(summary.Count),
 		}
 		if err := writer.Write(row); err != nil {
-			return fmt.Errorf("failed to write row: %w", err)
+			return fmt.Errorf("failed to write row to %s: %w", filename, err)
 		}
 	}
 
 	return nil
 }
 
-// writeSummaryCSV writes the summary info to a CSV file
-func writeSummaryCSV(results []CommitInfo) error {
-	file, err := os.Create("commit_summary.csv")
+// writeSummaryCSV writes the daily commit summary across all repos/branches to a CSV file
+func writeSummaryCSV(results []RepoBranchCommits, outputDir string) error {
+	timestamp := time.Now().Format("20060102150405")
+	filename := fmt.Sprintf("commit_summary_%s.csv", timestamp)
+	filepath := filepath.Join(outputDir, filename)
+
+	file, err := os.Create(filepath)
 	if err != nil {
-		return fmt.Errorf("failed to create commit_summary.csv: %w", err)
+		return fmt.Errorf("failed to create %s: %w", filename, err)
 	}
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Write header
+	// Write header - TASK.md: date,commit_count
 	header := []string{"Date", "CommitCount"}
 	if err := writer.Write(header); err != nil {
-		return fmt.Errorf("failed to write header: %w", err)
+		return fmt.Errorf("failed to write header to %s: %w", filename, err)
 	}
 
-	// Combine all commit dates
-	commitsByDate := make(map[string]int)
-	for _, info := range results {
-		for date, count := range info.CommitsByDate {
+	// Aggregate commits by date across all repos/branches
+	commitsByDate := make(map[string]int) // map[DateString]TotalCommitCount
+	for _, result := range results {
+		for date, count := range result.CommitsByDate {
 			commitsByDate[date] += count
 		}
 	}
@@ -333,7 +371,7 @@ func writeSummaryCSV(results []CommitInfo) error {
 			strconv.Itoa(summary.Count),
 		}
 		if err := writer.Write(row); err != nil {
-			return fmt.Errorf("failed to write row: %w", err)
+			return fmt.Errorf("failed to write row to %s: %w", filename, err)
 		}
 	}
 
