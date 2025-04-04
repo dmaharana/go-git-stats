@@ -11,11 +11,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"time"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 // RepoBranchCommits holds commit data aggregated by date for a specific repo and branch.
@@ -31,6 +33,9 @@ type SummaryEntry struct {
 }
 
 func main() {
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
 	// Define command line flags
 	baseDir := flag.String("dir", ".", "Base directory to scan for Git repositories")
 	batchSize := flag.Int("batch", 5, "Number of repositories to process concurrently")
@@ -39,37 +44,38 @@ func main() {
 	// Find all git repositories
 	repos, err := findGitRepos(*baseDir)
 	if err != nil {
-		fmt.Printf("Error finding git repositories: %v\n", err)
+		log.Error().Err(err).Msg("Error finding git repositories")
 		os.Exit(1)
 	}
 
-	fmt.Printf("Found %d git repositories\n", len(repos))
+	log.Info().Int("repo_count", len(repos)).Msg("Found git repositories")
+
 	// Process repositories in batches
 	results := processReposBatch(repos, *batchSize)
 
 	// Ensure baseDir is absolute for reliable output path generation
 	outputDir, err := filepath.Abs(*baseDir)
 	if err != nil {
-		fmt.Printf("Error resolving absolute path for base directory: %v\n", err)
+		log.Error().Err(err).Msg("Error resolving absolute path for base directory")
 		os.Exit(1)
 	}
 
 	// Write results to CSV files in the specified base directory
 	if err := writeCommitInfoCSV(results, outputDir); err != nil {
-		fmt.Printf("Error writing commit info CSV: %v\n", err)
+		log.Error().Err(err).Msg("Error writing commit info CSV")
 		os.Exit(1)
 	}
 
 	if err := writeSummaryCSV(results, outputDir); err != nil {
-		fmt.Printf("Error writing summary CSV: %v\n", err)
+		log.Error().Err(err).Msg("Error writing summary CSV")
 		os.Exit(1)
 	}
 	if err := writeYearlySummaryCSV(results, outputDir); err != nil {
-		fmt.Printf("Error writing yearly summary CSV: %v\n", err)
+		log.Error().Err(err).Msg("Error writing yearly summary CSV")
 		os.Exit(1)
 	}
 
-	fmt.Printf("Scan completed successfully. CSV files generated in %s\n", outputDir)
+	log.Info().Str("output_dir", outputDir).Msg("Scan completed successfully. CSV files generated")
 }
 
 // findGitRepos finds all bare git repositories in the given directory
@@ -118,7 +124,7 @@ func processReposBatch(repoPaths []string, batchSize int) []RepoBranchCommits {
 				defer wg.Done()
 				repoInfo, err := processRepo(path)
 				if err != nil {
-					fmt.Printf("Error processing repository %s: %v\n", path, err)
+					log.Error().Err(err).Str("repo_path", path).Msg("Error processing repository")
 					return
 				}
 
@@ -161,7 +167,7 @@ func processRepo(repoPath string) ([]RepoBranchCommits, error) {
 		// Only process local branches (refs/heads/)
 		if !ref.Name().IsBranch() {
 			return nil
-		} // <-- Added closing brace
+		}
 
 		branchName := ref.Name().Short()
 		commitsByDate := make(map[string]int) // map[DateString]CommitCount
@@ -171,22 +177,29 @@ func processRepo(repoPath string) ([]RepoBranchCommits, error) {
 		if err != nil {
 			// Handle case where a branch might not have a resolvable commit (e.g., empty branch)
 			// Or other errors during Log retrieval
-			fmt.Printf("Warning: Could not get commit history for branch %s in repo %s: %v\n", branchName, repoName, err)
+			log.Warn().Err(err).Str("branch", branchName).Str("repo", repoName).Msg("Could not get commit history")
 			return nil // Skip this branch
 		}
 
-		err = commitIter.ForEach(func(c *object.Commit) error {
-			dateStr := c.Author.When.Format("2006-01-02")
-			commitsByDate[dateStr]++
-			return nil
-		}) // <-- Added closing parenthesis
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warn().Interface("panic", r).Str("branch", branchName).Str("repo", repoName).Msg("Recovered from panic during commit iteration")
+				}
+			}()
 
-		if err != nil {
-			// This error comes from the ForEach function itself
-			return fmt.Errorf("failed during commit iteration for branch %s: %w", branchName, err)
-		}
+			iterErr := commitIter.ForEach(func(c *object.Commit) error {
+				dateStr := c.Author.When.Format("2006-01-02")
+				commitsByDate[dateStr]++
+				return nil
+			})
 
-		// Only add if there were commits on this branch
+			if iterErr != nil {
+				log.Warn().Err(iterErr).Str("branch", branchName).Str("repo", repoName).Msg("Error during commit iteration")
+			}
+		}()
+
+		// Add partial or full results if any commits were counted
 		if len(commitsByDate) > 0 {
 			results = append(results, RepoBranchCommits{
 				RepoName:      repoName,
@@ -281,8 +294,7 @@ func writeYearlySummaryCSV(results []RepoBranchCommits, outputDir string) error 
 			commitDate, err := time.Parse("2006-01-02", dateStr)
 			if err != nil {
 				// Should not happen if date format is correct
-				fmt.Printf("Warning: Could not parse date %s for repo %s, branch %s: %v\n",
-					dateStr, result.RepoName, result.BranchName, err)
+				log.Warn().Err(err).Str("date", dateStr).Str("repo", result.RepoName).Str("branch", result.BranchName).Msg("Could not parse date")
 				continue
 			}
 			commitsByYear[commitDate.Year()] += count
